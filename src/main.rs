@@ -11,9 +11,15 @@ struct Config {
     /// Fully-qualified domains to manage. Subdomains are auto-created on
     /// first activation if the IONOS DynDNS endpoint accepts them.
     domains: Vec<String>,
-    /// How often to refresh the public IP and trigger an update.
-    #[serde(default = "default_update_interval_secs")]
-    update_interval_secs: u64,
+    /// How often the heartbeat runs: detects public IP and queries DNS.
+    /// Alias `update_interval_secs` for backwards compat with older configs.
+    #[serde(default = "default_heartbeat_interval_secs", alias = "update_interval_secs")]
+    heartbeat_interval_secs: u64,
+    /// Minimum seconds between two GETs of the cached `updateUrl`.
+    /// IONOS rate-limits this endpoint to roughly 1 per 30s — going
+    /// faster gets you 429s and a ~30s cooldown. Default 30s.
+    #[serde(default = "default_publish_rate_limit_secs")]
+    publish_rate_limit_secs: u64,
     /// Public IP detection service(s). Comma-separated. Default: ifconfig.co,api.ipify.org.
     #[serde(default = "default_ip_providers")]
     ip_providers: Vec<String>,
@@ -26,8 +32,11 @@ struct Config {
     health_addr: String,
 }
 
-fn default_update_interval_secs() -> u64 {
-    300
+fn default_heartbeat_interval_secs() -> u64 {
+    60
+}
+fn default_publish_rate_limit_secs() -> u64 {
+    30
 }
 fn default_ip_providers() -> Vec<String> {
     vec!["ifconfig.co".into(), "api.ipify.org".into()]
@@ -43,10 +52,14 @@ fn default_health_addr() -> String {
 struct State {
     /// Per-domain `updateUrl` returned by IONOS, persisted across restarts.
     update_urls: std::collections::HashMap<String, String>,
-    /// Last public IP we successfully saw (for log noise reduction).
+    /// Last public IP we successfully saw and verified via DNS.
     last_ip: Option<String>,
     /// Last successful IONOS response timestamp.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
+    /// Timestamp of the last successful (2xx) `updateUrl` GET. Used to
+    /// enforce `publish_rate_limit_secs` and avoid IONOS 429s.
+    #[serde(default)]
+    last_publish_ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,7 +100,8 @@ async fn main() -> Result<()> {
         .with_context(|| "parse config.json")?;
     info!(
         domains = cfg.domains.len(),
-        update_secs = cfg.update_interval_secs,
+        heartbeat_secs = cfg.heartbeat_interval_secs,
+        rate_limit_secs = cfg.publish_rate_limit_secs,
         "ionos-subdomain-updater starting"
     );
 
@@ -117,19 +131,19 @@ async fn main() -> Result<()> {
         .user_agent("ionos-subdomain-updater/0.1")
         .build()?;
 
-    // Initial update cycle (no waiting on the interval).
-    if let Err(e) = run_cycle(&client, &cfg, &mut state).await {
-        warn!(error = %e, "initial update cycle failed");
+    // Initial heartbeat (no waiting on the interval).
+    if let Err(e) = run_heartbeat(&client, &cfg, &mut state).await {
+        warn!(error = %e, "initial heartbeat failed");
     }
     persist_state(&cfg.state_file, &state).await.ok();
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.update_interval_secs));
+    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.heartbeat_interval_secs));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         ticker.tick().await;
-        if let Err(e) = run_cycle(&client, &cfg, &mut state).await {
-            warn!(error = %e, "update cycle failed");
+        if let Err(e) = run_heartbeat(&client, &cfg, &mut state).await {
+            warn!(error = %e, "heartbeat failed");
         }
         persist_state(&cfg.state_file, &state).await.ok();
     }
@@ -157,151 +171,172 @@ async fn run_health_server(addr: &str) -> Result<()> {
     }
 }
 
-async fn run_cycle(
+async fn run_heartbeat(
     client: &reqwest::Client,
     cfg: &Config,
     state: &mut State,
 ) -> Result<()> {
-    let ip = detect_public_ip(client, &cfg.ip_providers).await?;
-    let published_ip = state.last_ip.clone();
-    let needs_publish = published_ip.as_deref() != Some(ip.as_str());
+    let my_ip = detect_public_ip(client, &cfg.ip_providers).await?;
+
+    // (1) Compare with what IONOS actually has registered. We trust the
+    //     DoH view over our local `state.last_ip` because IONOS could
+    //     have been edited externally, or our cached IP could be stale.
+    let doh_converged = match verify_dns_convergence(client, &cfg.domains, &my_ip).await {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(error = %e, "DoH check failed; will fall back to local state");
+            None
+        }
+    };
+
+    let local_converged = state.last_ip.as_deref() == Some(my_ip.as_str());
+
     info!(
-        %ip,
-        published = ?published_ip,
-        needs_publish,
-        "detected public IPv4"
+        %my_ip,
+        local_last = ?state.last_ip,
+        doh_converged = ?doh_converged,
+        "heartbeat: detected public IPv4"
     );
 
-    if !needs_publish {
-        // Already converged — nothing to do, no API calls. Avoids burning
-        // IONOS rate-limit budget on no-op cycles.
+    if matches!(doh_converged, Some(true)) && local_converged {
+        // Everything matches — skip entirely, no IONOS API call.
         return Ok(());
     }
 
-    // (1) Get an updateUrl. POST /dyndns both registers the entry and
-    //     returns a token we'll use to actually push the IP. Skip if we
-    //     already have one cached for this set of domains.
-    if state.update_urls.is_empty() {
-        let req = DynDnsRequest {
-            domains: &cfg.domains,
-            description: "ionos-subdomain-updater",
-        };
-        let resp = client
-            .post(ENDPOINT_DYNDNS)
-            .header("X-API-Key", &cfg.api_key)
-            .header("Accept", "application/json")
-            .json(&req)
-            .send()
-            .await
-            .context("IONOS POST /dyndns")?;
+    let needs_publish = match doh_converged {
+        Some(true) => false,           // DNS already correct, nothing to do
+        Some(false) => true,           // IONOS diverges from our IP
+        None => !local_converged,      // DoH unavailable, fall back to local
+    };
 
-        let status = resp.status();
-        let body_text = resp.text().await.context("read IONOS body")?;
-        if !status.is_success() {
-            error!(%status, body = %body_text, "IONOS DynDNS failed");
-            anyhow::bail!("IONOS DynDNS HTTP {}: {}", status, body_text);
+    if !needs_publish {
+        // DNS is correct but our local state hadn't caught up — sync it
+        // and skip the API call.
+        state.last_ip = Some(my_ip.clone());
+        return Ok(());
+    }
+
+    // (2) Rate-limit: skip if we published too recently. IONOS GETs of the
+    //     cached updateUrl get 429 after ~2 quick calls and need ~30s to
+    //     recover. We trust `last_publish_ts` and never set it on 4xx/5xx.
+    if let Some(last) = state.last_publish_ts {
+        let elapsed = (chrono::Utc::now() - last).num_seconds();
+        if elapsed < cfg.publish_rate_limit_secs as i64 {
+            info!(
+                elapsed_secs = elapsed,
+                rate_limit = cfg.publish_rate_limit_secs,
+                "publish rate-limited; defer to next heartbeat"
+            );
+            return Ok(());
         }
+    }
 
-        let parsed: DynDnsResponse =
-            serde_json::from_str(&body_text).context("parse IONOS DynDNS response")?;
-        info!(
-            bulk_id = ?parsed.bulk_id.as_deref(),
-            domains = ?parsed.domains,
-            "IONOS DynDNS accepted request"
-        );
-
-        match parsed.update_url {
-            Some(update_url) => {
-                for d in &cfg.domains {
-                    state.update_urls.insert(d.clone(), update_url.clone());
-                }
-                info!(%update_url, "cached updateUrl for next cycles");
-            }
-            None => {
-                warn!("IONOS response missing updateUrl; will retry next cycle");
+    // (3) Get a token if we don't have one (or if a previous GET came back
+    //     401 — see publish step below). POST /dyndns both registers the
+    //     entry and returns the updateUrl.
+    if state.update_urls.is_empty() {
+        match refresh_update_url(client, cfg, state).await {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(error = %e, "refresh_update_url failed");
+                return Ok(());
             }
         }
     }
 
-    // (2) Burst-publish until external DNS (verified via Google DoH so we
-    //     bypass local resolver caching) actually shows our public IP for
-    //     every configured domain. Stops on convergence or after 60s.
-    let converged = if state.update_urls.is_empty() {
-        false
-    } else {
-        burst_publish_until_converged(client, &state.update_urls, &ip).await
-    };
+    if state.update_urls.is_empty() {
+        warn!("no updateUrl cached; nothing to publish");
+        return Ok(());
+    }
 
+    // (4) Publish: dedupe URLs (IONOS returns ONE token for the whole batch),
+    //     hit each one. Treat 401 as a signal to drop the cache and refresh
+    //     on the next heartbeat (token rotation).
+    let unique_urls: std::collections::HashSet<&String> = state.update_urls.values().collect();
+    let mut any_ok = false;
+    let mut any_401 = false;
+    for url in &unique_urls {
+        match client.get(url.as_str()).send().await {
+            Ok(r) if r.status().is_success() => {
+                info!(url = %url, "publish ok; IONOS will set A-record to caller IP");
+                any_ok = true;
+            }
+            Ok(r) if r.status().as_u16() == 401 => {
+                warn!(url = %url, status = %r.status(), "updateUrl rejected; will refresh token next cycle");
+                any_401 = true;
+            }
+            Ok(r) => warn!(url = %url, status = %r.status(), "publish non-2xx"),
+            Err(e) => warn!(url = %url, error = %e, "publish request failed"),
+        }
+    }
+    if any_401 {
+        state.update_urls.clear();
+    }
+    if any_ok {
+        state.last_publish_ts = Some(chrono::Utc::now());
+    }
+
+    // (5) Update local view. Trust DoH over local; only mark the IP as
+    //     published once DNS actually shows it.
     state.last_success = Some(chrono::Utc::now());
-    if converged {
-        // Only mark this IP as "published" once DNS actually matches.
-        // Otherwise the next cycle will re-burst and try again.
-        state.last_ip = Some(ip);
+    if let Ok(true) = verify_dns_convergence(client, &cfg.domains, &my_ip).await {
+        state.last_ip = Some(my_ip);
     }
     Ok(())
 }
 
-/// Burst-publish loop: hit every *unique* `updateUrl` (all configured
-/// domains typically share one URL per POST /dyndns response), then verify
-/// via Google DoH, then wait. Returns true iff every A-record matches
-/// `my_ip` within the attempt cap.
-async fn burst_publish_until_converged(
+/// POST /dyndns to (re-)register the entry and cache the returned updateUrl.
+async fn refresh_update_url(
     client: &reqwest::Client,
-    urls: &std::collections::HashMap<String, String>,
-    my_ip: &str,
-) -> bool {
-    const BURST_INTERVAL: Duration = Duration::from_secs(3);
-    const BURST_MAX_ATTEMPTS: u32 = 20; // 60s total budget
-    const DELAY_BETWEEN_PUBLISHES: Duration = Duration::from_millis(500);
+    cfg: &Config,
+    state: &mut State,
+) -> Result<()> {
+    let req = DynDnsRequest {
+        domains: &cfg.domains,
+        description: "ionos-subdomain-updater",
+    };
+    let resp = client
+        .post(ENDPOINT_DYNDNS)
+        .header("X-API-Key", &cfg.api_key)
+        .header("Accept", "application/json")
+        .json(&req)
+        .send()
+        .await
+        .context("IONOS POST /dyndns")?;
 
-    // Dedupe: IONOS returns ONE updateUrl for the whole POST batch, so
-    // hitting it 5× for 5 domains would just trigger 429s.
-    let unique_urls: std::collections::HashSet<&String> = urls.values().collect();
-    let domains: Vec<String> = urls.keys().cloned().collect();
+    let status = resp.status();
+    let body_text = resp.text().await.context("read IONOS body")?;
+    if !status.is_success() {
+        error!(%status, body = %body_text, "IONOS DynDNS failed");
+        anyhow::bail!("IONOS DynDNS HTTP {}: {}", status, body_text);
+    }
 
+    let parsed: DynDnsResponse =
+        serde_json::from_str(&body_text).context("parse IONOS DynDNS response")?;
     info!(
-        max_attempts = BURST_MAX_ATTEMPTS,
-        interval_secs = BURST_INTERVAL.as_secs(),
-        unique_urls = unique_urls.len(),
-        domains = urls.len(),
-        "burst publish until DNS converges"
+        bulk_id = ?parsed.bulk_id.as_deref(),
+        domains = ?parsed.domains,
+        "IONOS DynDNS accepted request"
     );
 
-    for attempt in 1..=BURST_MAX_ATTEMPTS {
-        for url in &unique_urls {
-            match client.get(url.as_str()).send().await {
-                Ok(r) if r.status().is_success() => {
-                    info!(attempt, url = %url, "publish ok");
-                }
-                Ok(r) => warn!(attempt, status = %r.status(), "publish non-2xx"),
-                Err(e) => warn!(attempt, error = %e, "publish request failed"),
+    match parsed.update_url {
+        Some(update_url) => {
+            for d in &cfg.domains {
+                state.update_urls.insert(d.clone(), update_url.clone());
             }
-            tokio::time::sleep(DELAY_BETWEEN_PUBLISHES).await;
+            info!(%update_url, "cached updateUrl for next cycles");
+            Ok(())
         }
-
-        match verify_dns_convergence(client, &domains, my_ip).await {
-            Ok(true) => {
-                info!(attempt, "DNS A-records converged to public IP");
-                return true;
-            }
-            Ok(false) => tracing::debug!(attempt, "DNS not yet converged"),
-            Err(e) => tracing::warn!(attempt, error = %e, "DoH verify failed"),
-        }
-
-        if attempt < BURST_MAX_ATTEMPTS {
-            tokio::time::sleep(BURST_INTERVAL).await;
+        None => {
+            warn!("IONOS response missing updateUrl; will retry next cycle");
+            anyhow::bail!("IONOS POST /dyndns returned no updateUrl")
         }
     }
-    warn!(
-        attempts = BURST_MAX_ATTEMPTS,
-        "burst timed out; DNS may still lag (TTL / propagation) — will retry next cycle"
-    );
-    false
 }
 
 /// Query Google DoH for each domain's A-record. Returns true iff every
 /// domain resolves to `expected_ip`. Uses DoH (not the local resolver) so
-/// we don't see stale TTL caches during the burst.
+/// we don't see stale TTL caches.
 async fn verify_dns_convergence(
     client: &reqwest::Client,
     domains: &[String],
