@@ -30,6 +30,12 @@ struct Config {
     /// Bind address for the /healthz endpoint (HTTP).
     #[serde(default = "default_health_addr")]
     health_addr: String,
+    /// Force a re-publish every N seconds even if DoH + local state agree.
+    /// Defensive against silent IONOS-side drift (external record edits,
+    /// API success-without-actual-update, stale resolver caches). Default
+    /// 21600 (6h). Set to 0 to disable.
+    #[serde(default = "default_force_republish_secs")]
+    force_republish_secs: u64,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -47,6 +53,9 @@ fn default_state_file() -> PathBuf {
 fn default_health_addr() -> String {
     "0.0.0.0:8080".into()
 }
+fn default_force_republish_secs() -> u64 {
+    21600
+}
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct State {
@@ -60,6 +69,32 @@ struct State {
     /// enforce `publish_rate_limit_secs` and avoid IONOS 429s.
     #[serde(default)]
     last_publish_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Last attempt (publish or rate-limit-check) timestamp. Used for the
+    /// divergence-backoff: when DoH keeps reporting divergence, we slow
+    /// down attempts instead of hammering the API.
+    #[serde(default)]
+    last_attempt_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Number of consecutive heartbeats with `doh_converged=Some(false)`.
+    /// Reset to 0 on any converged or DoH-unavailable cycle.
+    #[serde(default)]
+    divergence_streak: u32,
+}
+
+/// How long to wait before the next publish attempt when DoH keeps
+/// reporting divergence. The publish API itself doesn't fix residual
+/// records (legacy A-records from earlier providers), so we back off
+/// after a few attempts and let `force_republish_secs` re-verify
+/// periodically. All thresholds must exceed `heartbeat_interval_secs`
+/// (default 60s) — otherwise the very next heartbeat would always
+/// satisfy `since_attempt >= backoff` and the backoff would be a no-op.
+fn backoff_for_streak(streak: u32) -> u64 {
+    match streak {
+        0 | 1 => 0,
+        2 => 120,
+        3 => 300,
+        4 => 600,
+        _ => 1800,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -191,16 +226,38 @@ async fn run_heartbeat(
 
     let local_converged = state.last_ip.as_deref() == Some(my_ip.as_str());
 
+    // Periodic force-republish: even if everything looks fine, refresh
+    // IONOS-side records every `force_republish_secs`. Catches silent
+    // drift (external edits, API success-without-actual-update, stale
+    // DoH caches masquerading as converged). 0 disables.
+    let force_due = match (state.last_success, cfg.force_republish_secs) {
+        (Some(ts), interval) if interval > 0 => {
+            (chrono::Utc::now() - ts).num_seconds() >= interval as i64
+        }
+        (None, interval) if interval > 0 => true,
+        _ => false,
+    };
+
     info!(
         %my_ip,
         local_last = ?state.last_ip,
         doh_converged = ?doh_converged,
+        force_due,
         "heartbeat: detected public IPv4"
     );
 
-    if matches!(doh_converged, Some(true)) && local_converged {
-        // Everything matches — skip entirely, no IONOS API call.
+    if matches!(doh_converged, Some(true)) && local_converged && !force_due {
+        // Everything matches AND we published recently — skip entirely.
         return Ok(());
+    }
+    if force_due {
+        info!(
+            age_secs = state.last_success
+                .map(|t| (chrono::Utc::now() - t).num_seconds()),
+            interval_secs = cfg.force_republish_secs,
+            reason = "max_age",
+            "force-republish triggered"
+        );
     }
 
     let needs_publish = match doh_converged {
@@ -215,6 +272,35 @@ async fn run_heartbeat(
         state.last_ip = Some(my_ip.clone());
         return Ok(());
     }
+
+    // (2a) Convergence-backoff: when DoH keeps reporting divergence for
+    //      many cycles in a row, we are likely looking at residual records
+    //      that the DynDNS API cannot delete (legacy A-records from
+    //      previous providers). Backing off avoids hammering IONOS with
+    //      publishes that won't fix the divergence. Force-republish
+    //      (`force_due`) bypasses this — that path is still allowed.
+    let mut divergence_streak = state.divergence_streak;
+    if matches!(doh_converged, Some(false)) {
+        divergence_streak = divergence_streak.saturating_add(1);
+    } else {
+        divergence_streak = 0;
+    }
+    state.divergence_streak = divergence_streak;
+    let backoff_secs = backoff_for_streak(divergence_streak);
+    if let Some(last) = state.last_attempt_ts {
+        let since_attempt = (chrono::Utc::now() - last).num_seconds();
+        if since_attempt < backoff_secs as i64 && !force_due {
+            info!(
+                streak = divergence_streak,
+                backoff_secs,
+                since_attempt_secs = since_attempt,
+                reason = "convergence_backoff",
+                "defer publish: DoH divergence in cooldown"
+            );
+            return Ok(());
+        }
+    }
+    state.last_attempt_ts = Some(chrono::Utc::now());
 
     // (2) Rate-limit: skip if we published too recently. IONOS GETs of the
     //     cached updateUrl get 429 after ~2 quick calls and need ~30s to
@@ -334,32 +420,49 @@ async fn refresh_update_url(
     }
 }
 
-/// Query Google DoH for each domain's A-record. Returns true iff every
-/// domain resolves to `expected_ip`. Uses DoH (not the local resolver) so
-/// we don't see stale TTL caches.
+/// Query multiple DoH providers for each domain's A-record. Returns true
+/// iff every domain resolves to `expected_ip` according to EVERY source.
+/// A single provider may cache stale data or experience transient
+/// outages — cross-checking two (Google + Cloudflare) avoids silent
+/// drift masquerading as convergence.
 async fn verify_dns_convergence(
     client: &reqwest::Client,
     domains: &[String],
     expected_ip: &str,
 ) -> Result<bool> {
+    const SOURCES: &[(&str, &str)] = &[
+        ("https://dns.google/resolve?name={domain}&type=A", ""),
+        (
+            "https://cloudflare-dns.com/dns-query?name={domain}&type=A",
+            "application/dns-json",
+        ),
+    ];
     for domain in domains {
-        let url = format!("https://dns.google/resolve?name={domain}&type=A");
-        let r = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("DoH GET {url}"))?;
-        let j: serde_json::Value = r.json().await.context("parse DoH JSON")?;
-        let answers = j
-            .get("Answer")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let matches = answers
-            .iter()
-            .any(|a| a.get("data").and_then(|d| d.as_str()) == Some(expected_ip));
-        if !matches {
-            return Ok(false);
+        for (tmpl, accept) in SOURCES {
+            let url = tmpl.replace("{domain}", domain);
+            let mut req = client.get(&url);
+            if !accept.is_empty() {
+                req = req.header("Accept", *accept);
+            }
+            let r = req
+                .send()
+                .await
+                .with_context(|| format!("DoH GET {url}"))?;
+            let j: serde_json::Value = r
+                .json()
+                .await
+                .with_context(|| format!("parse DoH JSON from {url}"))?;
+            let answers = j
+                .get("Answer")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let matches = answers
+                .iter()
+                .any(|a| a.get("data").and_then(|d| d.as_str()) == Some(expected_ip));
+            if !matches {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
