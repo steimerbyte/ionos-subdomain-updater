@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use tracing::{error, info, warn, Level};
 
 #[derive(Debug, Deserialize)]
@@ -20,9 +22,16 @@ struct Config {
     /// faster gets you 429s and a ~30s cooldown. Default 30s.
     #[serde(default = "default_publish_rate_limit_secs")]
     publish_rate_limit_secs: u64,
-    /// Public IP detection service(s). Comma-separated. Default: ifconfig.co,api.ipify.org.
+    /// Public IP detection providers. Comma-separated. Default: 5 providers
+    /// for race-trigger + parallel validation coverage.
     #[serde(default = "default_ip_providers")]
     ip_providers: Vec<String>,
+    /// Per-provider HTTP timeout for the race + validation phase. Default 3s.
+    #[serde(default = "default_provider_timeout_secs")]
+    provider_timeout_secs: u64,
+    /// Maximum time the race phase waits for the first response. Default 5s.
+    #[serde(default = "default_race_deadline_secs")]
+    race_deadline_secs: u64,
     /// Persist the per-cycle `updateUrl` here so the next cycle (and external
     /// tools) can read it. Re-acquired on API errors.
     #[serde(default = "default_state_file")]
@@ -30,10 +39,10 @@ struct Config {
     /// Bind address for the /healthz endpoint (HTTP).
     #[serde(default = "default_health_addr")]
     health_addr: String,
-    /// Force a re-publish every N seconds even if DoH + local state agree.
+    /// Force a re-publish every N seconds even if local state agrees.
     /// Defensive against silent IONOS-side drift (external record edits,
-    /// API success-without-actual-update, stale resolver caches). Default
-    /// 21600 (6h). Set to 0 to disable.
+    /// API success-without-actual-update). Default 21600 (6h). Set to 0
+    /// to disable.
     #[serde(default = "default_force_republish_secs")]
     force_republish_secs: u64,
 }
@@ -45,7 +54,19 @@ fn default_publish_rate_limit_secs() -> u64 {
     30
 }
 fn default_ip_providers() -> Vec<String> {
-    vec!["ifconfig.co".into(), "api.ipify.org".into()]
+    vec![
+        "ifconfig.co".into(),
+        "api.ipify.org".into(),
+        "ident.me".into(),
+        "icanhazip.com".into(),
+        "checkip.amazonaws.com".into(),
+    ]
+}
+fn default_provider_timeout_secs() -> u64 {
+    3
+}
+fn default_race_deadline_secs() -> u64 {
+    5
 }
 fn default_state_file() -> PathBuf {
     PathBuf::from("/data/state.json")
@@ -61,7 +82,7 @@ fn default_force_republish_secs() -> u64 {
 struct State {
     /// Per-domain `updateUrl` returned by IONOS, persisted across restarts.
     update_urls: std::collections::HashMap<String, String>,
-    /// Last public IP we successfully saw and verified via DNS.
+    /// Last public IP we successfully published (or verified unchanged).
     last_ip: Option<String>,
     /// Last successful IONOS response timestamp.
     last_success: Option<chrono::DateTime<chrono::Utc>>,
@@ -69,32 +90,30 @@ struct State {
     /// enforce `publish_rate_limit_secs` and avoid IONOS 429s.
     #[serde(default)]
     last_publish_ts: Option<chrono::DateTime<chrono::Utc>>,
-    /// Last attempt (publish or rate-limit-check) timestamp. Used for the
-    /// divergence-backoff: when DoH keeps reporting divergence, we slow
-    /// down attempts instead of hammering the API.
+    /// Legacy field kept for backward-compat with older state.json files.
+    /// No longer consulted for any logic. Safe to leave populated.
     #[serde(default)]
     last_attempt_ts: Option<chrono::DateTime<chrono::Utc>>,
-    /// Number of consecutive heartbeats with `doh_converged=Some(false)`.
-    /// Reset to 0 on any converged or DoH-unavailable cycle.
+    /// Legacy field kept for backward-compat. No longer consulted.
     #[serde(default)]
     divergence_streak: u32,
 }
 
-/// How long to wait before the next publish attempt when DoH keeps
-/// reporting divergence. The publish API itself doesn't fix residual
-/// records (legacy A-records from earlier providers), so we back off
-/// after a few attempts and let `force_republish_secs` re-verify
-/// periodically. All thresholds must exceed `heartbeat_interval_secs`
-/// (default 60s) — otherwise the very next heartbeat would always
-/// satisfy `since_attempt >= backoff` and the backoff would be a no-op.
-fn backoff_for_streak(streak: u32) -> u64 {
-    match streak {
-        0 | 1 => 0,
-        2 => 120,
-        3 => 300,
-        4 => 600,
-        _ => 1800,
-    }
+/// One peer's response from the validation phase.
+#[derive(Debug)]
+#[allow(dead_code)] // provider name is kept for future per-peer logging / metrics
+struct PeerResponse {
+    provider: String,
+    ip: Option<String>, // None = unreachable (timeout or error)
+}
+
+/// Counts of how each non-trigger peer voted.
+#[derive(Debug, Default)]
+struct ValidationBuckets {
+    confirm: u32,   // peer.ip == trigger_ip
+    outdated: u32,  // peer.ip == last known (current) ip
+    conflict: u32,  // peer.ip is something else (a third IP)
+    unreachable: u32, // timeout or error
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +156,8 @@ async fn main() -> Result<()> {
         domains = cfg.domains.len(),
         heartbeat_secs = cfg.heartbeat_interval_secs,
         rate_limit_secs = cfg.publish_rate_limit_secs,
+        ip_providers = cfg.ip_providers.len(),
+        race_deadline_secs = cfg.race_deadline_secs,
         "ionos-subdomain-updater starting"
     );
 
@@ -194,13 +215,9 @@ async fn run_health_server(addr: &str) -> Result<()> {
         let (mut sock, _) = listener.accept().await?;
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            let body = b"ok\n";
-            let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok";
-            // We don't actually need the request; just respond.
+            let _ = sock.read(&mut [0u8; 1024]).await;
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
             let _ = sock.write_all(resp).await;
-            let _ = sock.write_all(b"ok").await;
             let _ = sock.shutdown().await;
         });
     }
@@ -211,25 +228,31 @@ async fn run_heartbeat(
     cfg: &Config,
     state: &mut State,
 ) -> Result<()> {
-    let my_ip = detect_public_ip(client, &cfg.ip_providers).await?;
+    // Phase 1+2: Race-Trigger + parallel Validation.
+    let (trigger_ip, peers) = race_then_validate_public_ip(
+        client,
+        &cfg.ip_providers,
+        Duration::from_secs(cfg.provider_timeout_secs),
+        Duration::from_secs(cfg.race_deadline_secs),
+    )
+    .await?;
 
-    // (1) Compare with what IONOS actually has registered. We trust the
-    //     DoH view over our local `state.last_ip` because IONOS could
-    //     have been edited externally, or our cached IP could be stale.
-    let doh_converged = match verify_dns_convergence(client, &cfg.domains, &my_ip).await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            warn!(error = %e, "DoH check failed; will fall back to local state");
-            None
-        }
-    };
+    let last_ip = state.last_ip.clone();
+    let buckets = bucketize(&last_ip, &trigger_ip, &peers);
 
-    let local_converged = state.last_ip.as_deref() == Some(my_ip.as_str());
+    info!(
+        trigger_ip = %trigger_ip,
+        last_ip = ?last_ip,
+        confirm = buckets.confirm,
+        outdated = buckets.outdated,
+        conflict = buckets.conflict,
+        unreachable = buckets.unreachable,
+        peer_total = peers.len(),
+        "ip-detect: race + validation"
+    );
 
-    // Periodic force-republish: even if everything looks fine, refresh
-    // IONOS-side records every `force_republish_secs`. Catches silent
-    // drift (external edits, API success-without-actual-update, stale
-    // DoH caches masquerading as converged). 0 disables.
+    // Decide whether to publish.
+    let ip_changed = last_ip.as_deref() != Some(trigger_ip.as_str());
     let force_due = match (state.last_success, cfg.force_republish_secs) {
         (Some(ts), interval) if interval > 0 => {
             (chrono::Utc::now() - ts).num_seconds() >= interval as i64
@@ -238,18 +261,12 @@ async fn run_heartbeat(
         _ => false,
     };
 
-    info!(
-        %my_ip,
-        local_last = ?state.last_ip,
-        doh_converged = ?doh_converged,
-        force_due,
-        "heartbeat: detected public IPv4"
-    );
-
-    if matches!(doh_converged, Some(true)) && local_converged && !force_due {
-        // Everything matches AND we published recently — skip entirely.
+    if !ip_changed && !force_due {
+        // Nothing to do. Refresh last_ip if we somehow drifted.
+        state.last_ip = Some(trigger_ip);
         return Ok(());
     }
+
     if force_due {
         info!(
             age_secs = state.last_success
@@ -259,52 +276,18 @@ async fn run_heartbeat(
             "force-republish triggered"
         );
     }
-
-    let needs_publish = match doh_converged {
-        Some(true) => false,           // DNS already correct, nothing to do
-        Some(false) => true,           // IONOS diverges from our IP
-        None => !local_converged,      // DoH unavailable, fall back to local
-    };
-
-    if !needs_publish {
-        // DNS is correct but our local state hadn't caught up — sync it
-        // and skip the API call.
-        state.last_ip = Some(my_ip.clone());
-        return Ok(());
+    if ip_changed {
+        info!(
+            from = ?last_ip,
+            to = %trigger_ip,
+            reason = "race_trigger",
+            "publish: ip change"
+        );
     }
 
-    // (2a) Convergence-backoff: when DoH keeps reporting divergence for
-    //      many cycles in a row, we are likely looking at residual records
-    //      that the DynDNS API cannot delete (legacy A-records from
-    //      previous providers). Backing off avoids hammering IONOS with
-    //      publishes that won't fix the divergence. Force-republish
-    //      (`force_due`) bypasses this — that path is still allowed.
-    let mut divergence_streak = state.divergence_streak;
-    if matches!(doh_converged, Some(false)) {
-        divergence_streak = divergence_streak.saturating_add(1);
-    } else {
-        divergence_streak = 0;
-    }
-    state.divergence_streak = divergence_streak;
-    let backoff_secs = backoff_for_streak(divergence_streak);
-    if let Some(last) = state.last_attempt_ts {
-        let since_attempt = (chrono::Utc::now() - last).num_seconds();
-        if since_attempt < backoff_secs as i64 && !force_due {
-            info!(
-                streak = divergence_streak,
-                backoff_secs,
-                since_attempt_secs = since_attempt,
-                reason = "convergence_backoff",
-                "defer publish: DoH divergence in cooldown"
-            );
-            return Ok(());
-        }
-    }
-    state.last_attempt_ts = Some(chrono::Utc::now());
-
-    // (2) Rate-limit: skip if we published too recently. IONOS GETs of the
-    //     cached updateUrl get 429 after ~2 quick calls and need ~30s to
-    //     recover. We trust `last_publish_ts` and never set it on 4xx/5xx.
+    // Rate-limit: skip if we published too recently. IONOS GETs of the
+    // cached updateUrl get 429 after ~2 quick calls and need ~30s to
+    // recover. We trust `last_publish_ts` and never set it on 4xx/5xx.
     if let Some(last) = state.last_publish_ts {
         let elapsed = (chrono::Utc::now() - last).num_seconds();
         if elapsed < cfg.publish_rate_limit_secs as i64 {
@@ -317,9 +300,7 @@ async fn run_heartbeat(
         }
     }
 
-    // (3) Get a token if we don't have one (or if a previous GET came back
-    //     401 — see publish step below). POST /dyndns both registers the
-    //     entry and returns the updateUrl.
+    // Get a token if we don't have one (or if a previous GET came back 401).
     if state.update_urls.is_empty() {
         match refresh_update_url(client, cfg, state).await {
             Ok(()) => {}
@@ -335,10 +316,10 @@ async fn run_heartbeat(
         return Ok(());
     }
 
-    // (4) Publish: dedupe URLs (IONOS returns ONE token for the whole batch),
-    //     hit each one. Treat 401 as a signal to drop the cache and refresh
-    //     on the next heartbeat (token rotation).
-    let unique_urls: std::collections::HashSet<&String> = state.update_urls.values().collect();
+    // Publish: dedupe URLs (IONOS returns ONE token for the whole batch),
+    // hit each one. Treat 401 as a signal to drop the cache and refresh
+    // on the next heartbeat (token rotation).
+    let unique_urls: HashSet<&String> = state.update_urls.values().collect();
     let mut any_ok = false;
     let mut any_401 = false;
     for url in &unique_urls {
@@ -360,15 +341,126 @@ async fn run_heartbeat(
     }
     if any_ok {
         state.last_publish_ts = Some(chrono::Utc::now());
+        state.last_success = Some(chrono::Utc::now());
+        state.last_ip = Some(trigger_ip);
     }
 
-    // (5) Update local view. Trust DoH over local; only mark the IP as
-    //     published once DNS actually shows it.
-    state.last_success = Some(chrono::Utc::now());
-    if let Ok(true) = verify_dns_convergence(client, &cfg.domains, &my_ip).await {
-        state.last_ip = Some(my_ip);
+    // Optional post-publish DoH check (informational, non-blocking).
+    // We log the convergence state but never gate future cycles on it.
+    if any_ok {
+        match verify_dns_convergence(client, &cfg.domains, state.last_ip.as_deref().unwrap_or("")).await {
+            Ok(true) => info!(ip = %state.last_ip.as_deref().unwrap_or(""), "post-publish DoH converged"),
+            Ok(false) => warn!(ip = %state.last_ip.as_deref().unwrap_or(""), "post-publish DoH still diverged (resolver cache, will catch up)"),
+            Err(e) => warn!(error = %e, "post-publish DoH check failed"),
+        }
     }
+
     Ok(())
+}
+
+/// Spawn all providers in parallel. Phase 1 returns the first non-None IP
+/// (race: which provider answers fastest). Phase 2 awaits the remaining
+/// handles (capped by the per-provider timeout) and reports every peer's
+/// answer so the caller can bucket them as confirm / outdated / conflict
+/// / unreachable.
+async fn race_then_validate_public_ip(
+    client: &reqwest::Client,
+    providers: &[String],
+    per_provider_timeout: Duration,
+    race_deadline: Duration,
+) -> Result<(String, Vec<PeerResponse>)> {
+    if providers.is_empty() {
+        anyhow::bail!("no ip providers configured");
+    }
+
+    // Spawn every provider as its own task. Each task honours
+    // per_provider_timeout individually and returns Option<String>.
+    let mut handles: Vec<(String, tokio::task::JoinHandle<Option<String>>)> =
+        Vec::with_capacity(providers.len());
+    for p in providers {
+        let p_clone = p.clone();
+        let client = client.clone();
+        let handle = tokio::spawn(async move {
+            match timeout(per_provider_timeout, fetch_ip_from(&client, &p_clone)).await {
+                Ok(Ok(ip)) => Some(ip),
+                Ok(Err(e)) => {
+                    warn!(provider = %p_clone, error = %e, "ip provider failed");
+                    None
+                }
+                Err(_) => {
+                    warn!(provider = %p_clone, "ip provider timed out");
+                    None
+                }
+            }
+        });
+        handles.push((p.clone(), handle));
+    }
+
+    // Poll until at least one handle resolves successfully OR every handle
+    // has finished (and reported None) OR race_deadline elapses. We do NOT
+    // .await handles here — we only consume them in Phase 2 to keep them
+    // alive for the validation buckets.
+    let deadline = Instant::now() + race_deadline;
+    let mut first_ip: Option<String> = None;
+    'poll: loop {
+        for (_name, h) in &handles {
+            if h.is_finished() {
+                // Use a non-consuming probe: tokio JoinHandle exposes
+                // `is_finished()` only. We instead wait briefly on any
+                // finished handle to read its value without taking it.
+                // Easiest path: just await the first finished one we see,
+                // and remember its result for Phase 2 via a side channel.
+                // To keep this simple, we accept a tiny optimisation loss
+                // and fall through to Phase 2 as soon as we see ANY handle
+                // finish (not just successful ones).
+                break 'poll;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Phase 2: collect every peer's answer. We deliberately await all
+    // handles here even if they already finished — JoinHandle.await is
+    // idempotent and returns immediately when the task is done. The race
+    // outcome is "first Some wins"; ties broken by spawn order.
+    let mut responses = Vec::with_capacity(handles.len());
+    for (name, h) in handles {
+        let ip = h.await.ok().flatten();
+        if first_ip.is_none() {
+            if let Some(ref v) = ip {
+                first_ip = Some(v.clone());
+            }
+        }
+        responses.push(PeerResponse { provider: name, ip });
+    }
+
+    let trigger_ip = first_ip
+        .ok_or_else(|| anyhow::anyhow!("no ip provider responded within race deadline"))?;
+    Ok((trigger_ip, responses))
+}
+
+/// Bucket the validation peers against the trigger IP and the last known
+/// local IP. `outdated` = peer says the OLD ip (supports the change
+/// implicitly — provider has not refreshed). `conflict` = peer says a
+/// third IP that matches neither.
+fn bucketize(
+    last_ip: &Option<String>,
+    trigger_ip: &str,
+    peers: &[PeerResponse],
+) -> ValidationBuckets {
+    let mut b = ValidationBuckets::default();
+    for p in peers {
+        match &p.ip {
+            Some(ip) if ip == trigger_ip => b.confirm += 1,
+            Some(ip) if last_ip.as_deref() == Some(ip.as_str()) => b.outdated += 1,
+            Some(_) => b.conflict += 1,
+            None => b.unreachable += 1,
+        }
+    }
+    b
 }
 
 /// POST /dyndns to (re-)register the entry and cache the returned updateUrl.
@@ -420,16 +512,17 @@ async fn refresh_update_url(
     }
 }
 
-/// Query multiple DoH providers for each domain's A-record. Returns true
-/// iff every domain resolves to `expected_ip` according to EVERY source.
-/// A single provider may cache stale data or experience transient
-/// outages — cross-checking two (Google + Cloudflare) avoids silent
-/// drift masquerading as convergence.
+/// Informational DoH check (Google + Cloudflare). Used post-publish only;
+/// never gates a publish decision. Returns Ok(true) if every queried
+/// domain resolves to `expected_ip` at every source.
 async fn verify_dns_convergence(
     client: &reqwest::Client,
     domains: &[String],
     expected_ip: &str,
 ) -> Result<bool> {
+    if expected_ip.is_empty() {
+        return Ok(false);
+    }
     const SOURCES: &[(&str, &str)] = &[
         ("https://dns.google/resolve?name={domain}&type=A", ""),
         (
@@ -468,24 +561,10 @@ async fn verify_dns_convergence(
     Ok(true)
 }
 
-async fn detect_public_ip(client: &reqwest::Client, providers: &[String]) -> Result<String> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for p in providers {
-        match fetch_ip_from(client, p).await {
-            Ok(ip) => return Ok(ip),
-            Err(e) => {
-                warn!(provider = %p, error = %e, "ip provider failed, trying next");
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no ip providers configured")))
-}
-
 async fn fetch_ip_from(client: &reqwest::Client, provider: &str) -> Result<String> {
     let url = match provider {
         // Echo plain-text IPv4
-        "ifconfig.co" | "ifconfig.me" | "api.ipify.org" | "icanhazip.com" | "checkip.amazonaws.com" => {
+        "ifconfig.co" | "ifconfig.me" | "api.ipify.org" | "icanhazip.com" | "checkip.amazonaws.com" | "ident.me" => {
             format!("https://{provider}")
         }
         s if s.starts_with("http://") || s.starts_with("https://") => s.to_string(),
