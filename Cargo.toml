@@ -12,6 +12,8 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
+futures = "0.3"
 
 [profile.release]
 lto = true
