@@ -45,6 +45,16 @@ struct Config {
     /// to disable.
     #[serde(default = "default_force_republish_secs")]
     force_republish_secs: u64,
+    /// Optional: apex domain to manage via IONOS Records API
+    /// (e.g. "steimercloud.xyz"). When set, the apex A-record is kept in
+    /// sync with the detected public IP after every successful DynDNS
+    /// publish. Reuses `api_key` via X-API-Key auth — works iff that key
+    /// has `dns:zones` scope on IONOS. Defaults to None (no apex management).
+    #[serde(default)]
+    apex_domain: Option<String>,
+    /// TTL in seconds for the apex A-record PATCH. Default 300.
+    #[serde(default = "default_apex_ttl_secs")]
+    apex_ttl_secs: u32,
 }
 
 fn default_heartbeat_interval_secs() -> u64 {
@@ -77,6 +87,9 @@ fn default_health_addr() -> String {
 fn default_force_republish_secs() -> u64 {
     21600
 }
+fn default_apex_ttl_secs() -> u32 {
+    300
+}
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct State {
@@ -97,6 +110,19 @@ struct State {
     /// Legacy field kept for backward-compat. No longer consulted.
     #[serde(default)]
     divergence_streak: u32,
+    /// Cached IONOS zone ID for `Config::apex_domain`. Discovered lazily
+    /// on first apex publish; persisted to skip the listing call on
+    /// subsequent cycles. Cleared automatically on lookup failure.
+    #[serde(default)]
+    apex_zone_id: Option<String>,
+    /// Cached IONOS apex A-record ID (the record with empty/`@` name and
+    /// type=A). Same lifecycle as `apex_zone_id`.
+    #[serde(default)]
+    apex_record_id: Option<String>,
+    /// Last content value the apex update wrote. Used to suppress no-op
+    /// PUTs and to detect out-of-band drift on restart (forces a re-write).
+    #[serde(default)]
+    apex_record_content: Option<String>,
 }
 
 /// One peer's response from the validation phase.
@@ -135,6 +161,38 @@ struct DynDnsResponse {
 
 const ENDPOINT_DYNDNS: &str = "https://api.hosting.ionos.com/dns/v1/dyndns";
 
+/// Base URL for the IONOS Records/Zones API (legacy hosting endpoint,
+/// same auth scheme as DynDNS: `X-API-Key`). Used for apex A-record
+/// updates since the DynDNS endpoint cannot touch the zone apex.
+const IONOS_API_BASE: &str = "https://api.hosting.ionos.com/dns/v1";
+
+#[derive(Debug, Deserialize)]
+struct ZoneSummary {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ZonesList {
+    #[serde(default)]
+    items: Vec<ZoneSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordSummary {
+    id: String,
+    #[serde(rename = "type")]
+    rec_type: String,
+    name: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordsList {
+    #[serde(default)]
+    items: Vec<RecordSummary>,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -158,6 +216,7 @@ async fn main() -> Result<()> {
         rate_limit_secs = cfg.publish_rate_limit_secs,
         ip_providers = cfg.ip_providers.len(),
         race_deadline_secs = cfg.race_deadline_secs,
+        apex = ?cfg.apex_domain.as_deref(),
         "ionos-subdomain-updater starting"
     );
 
@@ -347,11 +406,29 @@ async fn run_heartbeat(
 
     // Optional post-publish DoH check (informational, non-blocking).
     // We log the convergence state but never gate future cycles on it.
+    // Includes the apex domain if apex management is configured.
     if any_ok {
-        match verify_dns_convergence(client, &cfg.domains, state.last_ip.as_deref().unwrap_or("")).await {
-            Ok(true) => info!(ip = %state.last_ip.as_deref().unwrap_or(""), "post-publish DoH converged"),
-            Ok(false) => warn!(ip = %state.last_ip.as_deref().unwrap_or(""), "post-publish DoH still diverged (resolver cache, will catch up)"),
+        let ip_for_doh = state.last_ip.clone().unwrap_or_default();
+        let mut doh_targets: Vec<String> = cfg.domains.clone();
+        if let Some(apex) = &cfg.apex_domain {
+            doh_targets.push(apex.clone());
+        }
+        match verify_dns_convergence(client, &doh_targets, &ip_for_doh).await {
+            Ok(true) => info!(ip = %ip_for_doh, "post-publish DoH converged"),
+            Ok(false) => warn!(ip = %ip_for_doh, "post-publish DoH still diverged (resolver cache, will catch up)"),
             Err(e) => warn!(error = %e, "post-publish DoH check failed"),
+        }
+    }
+
+    // Apex management (if configured). Reuses `api_key` via X-API-Key on
+    // the legacy Records API. Runs after DynDNS publish so we only update
+    // the apex when we've actually pushed a new IP to IONOS.
+    if any_ok {
+        let ip_for_apex = state.last_ip.clone().unwrap_or_default();
+        if !ip_for_apex.is_empty() {
+            if let Err(e) = sync_apex_record(client, cfg, state, &ip_for_apex).await {
+                warn!(error = %e, "apex sync failed (will retry next cycle)");
+            }
         }
     }
 
@@ -510,6 +587,159 @@ async fn refresh_update_url(
             anyhow::bail!("IONOS POST /dyndns returned no updateUrl")
         }
     }
+}
+
+/// Look up the IONOS zone ID for a fully-qualified domain. Caches the
+/// result in `state.apex_zone_id` and reuses it on subsequent calls.
+async fn find_zone_id(
+    client: &reqwest::Client,
+    api_key: &str,
+    zone_name: &str,
+    state: &mut State,
+) -> Result<String> {
+    if let Some(id) = state.apex_zone_id.as_ref() {
+        return Ok(id.clone());
+    }
+    let url = format!("{IONOS_API_BASE}/zones");
+    let resp = client
+        .get(&url)
+        .header("X-API-Key", api_key)
+        .send()
+        .await
+        .context("GET /zones")?
+        .error_for_status()
+        .context("GET /zones status")?
+        .json::<ZonesList>()
+        .await
+        .context("parse zones list")?;
+    let id = resp
+        .items
+        .into_iter()
+        .find(|z| z.name == zone_name)
+        .map(|z| z.id)
+        .ok_or_else(|| anyhow::anyhow!("zone {zone_name} not found in IONOS account"))?;
+    state.apex_zone_id = Some(id.clone());
+    Ok(id)
+}
+
+/// Find the apex A-record (name == "" or "@", type == "A") in the given
+/// zone. Caches both the record ID and the current content.
+async fn find_apex_a_record(
+    client: &reqwest::Client,
+    api_key: &str,
+    zone_id: &str,
+    state: &mut State,
+) -> Result<(String, String)> {
+    if let (Some(id), Some(content)) = (state.apex_record_id.as_ref(), state.apex_record_content.as_ref()) {
+        return Ok((id.clone(), content.clone()));
+    }
+    let url = format!("{IONOS_API_BASE}/zones/{zone_id}/records");
+    let resp = client
+        .get(&url)
+        .header("X-API-Key", api_key)
+        .send()
+        .await
+        .context("GET /zones/{zoneId}/records")?
+        .error_for_status()
+        .context("GET records status")?
+        .json::<RecordsList>()
+        .await
+        .context("parse records list")?;
+    let rec = resp
+        .items
+        .into_iter()
+        .find(|r| r.rec_type == "A" && (r.name.is_empty() || r.name == "@"))
+        .ok_or_else(|| anyhow::anyhow!("no apex A-record found in zone {zone_id}"))?;
+    state.apex_record_id = Some(rec.id.clone());
+    state.apex_record_content = Some(rec.content.clone());
+    Ok((rec.id, rec.content))
+}
+
+/// PATCH (PUT) the apex A-record. Uses full-update PUT because the legacy
+/// API lacks a partial-update endpoint per `ionosctl` implementation notes.
+/// No-op if the current content already equals `new_ip` (saves API quota).
+#[allow(clippy::too_many_arguments)] // (client, auth, zone, record, content, ip, ttl, state)
+async fn update_apex_a_record(
+    client: &reqwest::Client,
+    api_key: &str,
+    zone_id: &str,
+    record_id: &str,
+    current_content: &str,
+    new_ip: &str,
+    ttl: u32,
+    state: &mut State,
+) -> Result<()> {
+    if current_content == new_ip {
+        info!(ip = %new_ip, "apex already up-to-date; skipping PATCH");
+        return Ok(());
+    }
+    let url = format!("{IONOS_API_BASE}/zones/{zone_id}/records/{record_id}");
+    let body = serde_json::json!({
+        "content": new_ip,
+        "ttl": ttl,
+        "disabled": false,
+    });
+    let resp = client
+        .put(&url)
+        .header("X-API-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .context("PUT apex record")?;
+    let status = resp.status();
+    let body_text = resp.text().await.context("read PUT body")?;
+    if !status.is_success() {
+        anyhow::bail!("apex PUT HTTP {status}: {body_text}");
+    }
+    state.apex_record_content = Some(new_ip.to_string());
+    info!(
+        %status,
+        from = %current_content,
+        to = %new_ip,
+        "apex A-record updated"
+    );
+    Ok(())
+}
+
+/// Top-level orchestrator for the apex update: discover zone + record,
+/// then PUT the new IP. On 404 or auth failure, clear cached IDs so the
+/// next cycle re-discovers rather than retrying a stale ID.
+async fn sync_apex_record(
+    client: &reqwest::Client,
+    cfg: &Config,
+    state: &mut State,
+    new_ip: &str,
+) -> Result<()> {
+    let apex = match &cfg.apex_domain {
+        Some(a) => a,
+        None => return Ok(()), // apex management disabled
+    };
+    if let Err(e) = (async {
+        let zone_id = find_zone_id(client, &cfg.api_key, apex, state).await?;
+        let (record_id, current_content) =
+            find_apex_a_record(client, &cfg.api_key, &zone_id, state).await?;
+        update_apex_a_record(
+            client,
+            &cfg.api_key,
+            &zone_id,
+            &record_id,
+            &current_content,
+            new_ip,
+            cfg.apex_ttl_secs,
+            state,
+        )
+        .await
+    })
+    .await
+    {
+        // Clear caches so the next cycle re-discovers; permanent errors
+        // (404 / 403) would otherwise wedge the updater.
+        state.apex_zone_id = None;
+        state.apex_record_id = None;
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Informational DoH check (Google + Cloudflare). Used post-publish only;
